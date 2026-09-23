@@ -112,6 +112,11 @@ def check_config(r: Report, cfg_path: str):
 
 
 def _check_franka_identity(r: Report, cfg: dict) -> None:
+    if isinstance(cfg.get("robot"), str):
+        # Simulator configs (robot_robolab*.yaml, robot_maniskill.yaml) name an embodiment, not a
+        # hardware block: nothing to verify here.
+        r.ok(f"sim embodiment — robot: {cfg['robot']} (no hardware identity to check)")
+        return
     rb = cfg.get("robot", {}) or {}
     if rb.get("nuc_ip"):
         r.ok("robot.nuc_ip", str(rb["nuc_ip"]))

@@ -93,6 +93,11 @@ def parse_args() -> argparse.Namespace:
         help="RoboLab Task class name, e.g. BananaInBowlTask (see --list-tasks).",
     )
     parser.add_argument("--instruction-type", default=None, help="default | vague | specific")
+    parser.add_argument(
+        "--robot", default=None, choices=(None, "franka", "droid"),
+        help="Embodiment to register the task against: franka (Panda hand, core/sim/robolab_franka.py) "
+             "or droid (RoboLab's stock Franka + Robotiq 2F-85). Overrides the config's `robot:`.",
+    )
     parser.add_argument("--camera-preset", default=None, help="WRIST_LEFT | WRIST_LEFT_RIGHT | ...")
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=None)
@@ -163,6 +168,7 @@ def _fold_overrides(args: argparse.Namespace, robot_cfg: dict) -> dict:
     for arg_name, cfg_key in [
         ("task", "task"),
         ("instruction_type", "instruction_type"),
+        ("robot", "robot"),
         ("camera_preset", "camera_preset"),
         ("device", "device"),
         ("seed", "seed"),
@@ -277,6 +283,7 @@ def _run(args, cfg, client, prompt_path, prompt_template) -> int:
         device=str(cfg.get("device", "cuda:0")),
         seed=seed,
         instruction_type=str(cfg.get("instruction_type", "default")),
+        robot=str(cfg.get("robot", "franka")),   # upstream never forwarded the config's `robot:`; it was always franka
         camera_preset=str(cfg.get("camera_preset", "WRIST_LEFT")),
         renderer=str(cfg.get("renderer", "realtime")),
         rendering_type=cfg.get("rendering_type"),
