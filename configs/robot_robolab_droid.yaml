@@ -8,12 +8,13 @@
 #   wrist_rotation_degrees: 0          RoboLab's wrist_cam is upright as rendered (fingers at the
 #                                      BOTTOM). The fine-tuned adapters expect fingertips at the TOP;
 #                                      re-measure with --dump-views before using one here.
-#   vlm_backend: chatgpt               zero-shot frontier VLM by default (the sim LoRA was trained on
+#   vlm_backend: codex                 zero-shot via the ChatGPT subscription (Codex proxy) by default;
+#                                      chatgpt/gemini need API keys (the sim LoRA was trained on
 #                                      the Panda-hand embodiment, so it is off-distribution here).
 #                                      gemini and the fine-tuned vllm profiles are still available.
 #
 #   python scripts/run_robolab_mvtoken.py --robot-config configs/robot_robolab_droid.yaml \
-#       --version v3 --task PutTwoMugsOnShelfTask --episodes 5 --vlm-backend chatgpt
+#       --version v3 --task PutTwoMugsOnShelfTask --episodes 5 --vlm-backend codex
 #
 # Lab experiment state rides in an optional overlay (absent publicly).
 overlays:
@@ -181,7 +182,7 @@ v0:
 
 # Which served VLM the runner talks to. Released checkpoints are named
 # <model>_showharness_<split>; see docs/finetuned.md for the base model and FAMILY each needs.
-vlm_backend: chatgpt
+vlm_backend: codex
 
 vlm:
   base_url: http://localhost:8000/v1
@@ -192,6 +193,18 @@ vlm:
   api_key: EMPTY
 
 vlm_backends:
+  # ---- Zero-shot through the ChatGPT SUBSCRIPTION (no API key) ---------------
+  # scripts/codex/codex_proxy.py answers the OpenAI chat protocol locally and forwards to
+  # Codex (login in ~/.codex, the same one Astra-as-policy uses). Start it first:
+  #   ~/Desktop/trc/piper-x-policy/.venv/bin/python scripts/codex/codex_proxy.py --port 8010 --model gpt-6-astra
+  # `model` may carry an effort suffix (gpt-5.5:low). provider: vllm keeps the payload unmodified.
+  codex:
+    provider: vllm
+    base_url: http://localhost:8010/v1
+    model: gpt-6-astra
+    max_tokens: 256
+    reasoning_cot: false
+    max_retries: 5
   # ---- Zero-shot frontier VLMs (hosted; keys in configs/secrets.env) -------
   chatgpt:
     provider: openai
