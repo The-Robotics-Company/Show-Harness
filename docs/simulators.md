@@ -79,6 +79,7 @@ checks for it up front and prints the fix.
 python scripts/run_robolab_mvtoken.py --list-tasks                                     # no Isaac Sim needed
 python scripts/run_robolab_mvtoken.py --task RubiksCubeTask --dump-views --probe-axes --no-rollout   # calibration only, no VLM
 python scripts/run_robolab_mvtoken.py --version v3 --task RubiksCubeTask --episodes 5
+python scripts/run_robolab_mvtoken.py --version v3 --task RubiksCubeTask --num-envs 5        # 5 envs in lockstep, one VLM call each per step (core/sim/mvtoken_robolab_parallel.py); per-env run dirs task_0..4
 ```
 
 `--task` takes the task class name; `--episodes N` reuses one Isaac Sim app and

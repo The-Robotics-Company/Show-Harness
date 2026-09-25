@@ -223,6 +223,8 @@ def check_hardware(r: Report, cfg: dict) -> None:
     if hardware != "franka":
         return  # piper bring-up is covered by the ROS checks above
     rb = cfg.get("robot", {}) or {}
+    if not isinstance(rb, dict):
+        return  # sim config: `robot:` names an embodiment (franka | droid), there is no NUC
     ip, port = rb.get("nuc_ip"), int(rb.get("nuc_port", 4242))
     if not ip:
         return  # already failed in the identity check

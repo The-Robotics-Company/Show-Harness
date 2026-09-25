@@ -8,13 +8,19 @@
 #   wrist_rotation_degrees: 0          RoboLab's wrist_cam is upright as rendered (fingers at the
 #                                      BOTTOM). The fine-tuned adapters expect fingertips at the TOP;
 #                                      re-measure with --dump-views before using one here.
+#   scene                              the home_office rig USD (HDR dome + visible ground plane), spawned by
+#                                      core/sim/robolab_task.py exactly like RoboLab's pi05/Astra rollouts,
+#                                      instead of RoboLab's stock SphereLight + full-scale HDR backdrop.
 #   vlm_backend: codex                 zero-shot via the ChatGPT subscription (Codex proxy) by default;
 #                                      chatgpt/gemini need API keys (the sim LoRA was trained on
 #                                      the Panda-hand embodiment, so it is off-distribution here).
 #                                      gemini and the fine-tuned vllm profiles are still available.
 #
 #   python scripts/run_robolab_mvtoken.py --robot-config configs/robot_robolab_droid.yaml \
-#       --version v3 --task PutTwoMugsOnShelfTask --episodes 5 --vlm-backend codex
+#       --version v3 --task PutTwoMugsOnShelfTask --num-envs 5 --max-steps 337 --vlm-backend codex
+#   (--num-envs N steps N envs in lockstep with one VLM call each per macro-step, see
+#   core/sim/mvtoken_robolab_parallel.py; --max-steps 337 x 8 control steps = the task's 180 s, so
+#   RoboLab's own time-out is what ends an episode, as for pi05/Astra.)
 #
 # Lab experiment state rides in an optional overlay (absent publicly).
 overlays:
@@ -50,7 +56,7 @@ episodes: 1                 # episodes per process (the Isaac Sim app + env are 
 headless: true
 renderer: realtime          # realtime (RaytracedLighting) | pathtracing (offline, slow)
 rendering_type: null        # null | performance | balanced | quality
-enable_subtask: false       # RoboLab's per-step subtask predicates: extra physics queries,
+enable_subtask: true        # RoboLab's per-step subtask predicates: extra physics queries,
                             # and MVTOKEN eval only consumes the binary success.
 
 # ---- Cameras ---------------------------------------------------------------
@@ -97,7 +103,7 @@ use_wrist_image: true
 # (RoboLab's stock over_shoulder_left_camera is 16:9 and DOES need 1.3333 here: letterboxing
 # 16:9 into a 256 square leaves 256x144 of picture inside 56 black rows, so the scene fills
 # far less of the frame than in training. Set that value if you switch to robot: droid.)
-agentview_crop_aspect: null
+agentview_crop_aspect: 1.3333
 # 4:3, the SAME as the agentview and as every real rig -- not because the sensor is 4:3
 # (it renders 256x256) but because the stored frame must be. resize_with_pad of a square
 # image into a square is the identity, so with no crop the wrist came out filling the
@@ -196,8 +202,9 @@ vlm_backends:
   # ---- Zero-shot through the ChatGPT SUBSCRIPTION (no API key) ---------------
   # scripts/codex/codex_proxy.py answers the OpenAI chat protocol locally and forwards to
   # Codex (login in ~/.codex, the same one Astra-as-policy uses). Start it first:
-  #   ~/Desktop/trc/piper-x-policy/.venv/bin/python scripts/codex/codex_proxy.py --port 8010 --model gpt-6-astra
+  #   ~/Desktop/trc/piper-x-policy/.venv/bin/python scripts/codex/codex_proxy.py --port 8010 --model gpt-6-astra --effort high --pool 8
   # `model` may carry an effort suffix (gpt-5.5:low). provider: vllm keeps the payload unmodified.
+  # --pool = concurrent Codex clients; give it at least --num-envs so parallel envs do not queue.
   codex:
     provider: vllm
     base_url: http://localhost:8010/v1

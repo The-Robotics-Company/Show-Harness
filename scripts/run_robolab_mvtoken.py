@@ -149,6 +149,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model", default=os.environ.get("VLLM_MODEL"))
     parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument(
+        "--num-envs", type=int, default=None,
+        help="RoboLab envs stepped in lockstep, each with its own VLM call/controller/log "
+             "(core.sim.mvtoken_robolab_parallel). 1 (default) = the sequential runner.",
+    )
     parser.add_argument("--loop-period-s", type=float, default=None)
     parser.add_argument("--log-dir", default=None)
     parser.add_argument(
@@ -174,6 +179,7 @@ def _fold_overrides(args: argparse.Namespace, robot_cfg: dict) -> dict:
         ("seed", "seed"),
         ("episode_index", "episode_index"),
         ("episodes", "episodes"),
+        ("num_envs", "num_envs"),
         ("renderer", "renderer"),
         ("rendering_type", "rendering_type"),
         ("enable_subtask", "enable_subtask"),
@@ -271,6 +277,7 @@ def _run(args, cfg, client, prompt_path, prompt_template) -> int:
     from core.sim.robolab_task import make_robolab_task, probe_move_axes, reset_robolab
 
     episodes = max(1, int(cfg.get("episodes", 1)))
+    num_envs = max(1, int(cfg.get("num_envs", 1) or 1))
     seed = int(cfg["seed"]) + int(cfg.get("episode_index", 0))
 
     # The logger is built BEFORE the env so RoboLab's own artefacts (env_cfg.json) land in
@@ -279,7 +286,7 @@ def _run(args, cfg, client, prompt_path, prompt_template) -> int:
     logger = EpisodeLogger(Path(ROOT) / cfg["log_dir"], 0, variant=f"RL-{cfg['task']}")
     handle = make_robolab_task(
         task=str(cfg["task"]),
-        num_envs=1,
+        num_envs=num_envs,
         device=str(cfg.get("device", "cuda:0")),
         seed=seed,
         instruction_type=str(cfg.get("instruction_type", "default")),
@@ -302,13 +309,16 @@ def _run(args, cfg, client, prompt_path, prompt_template) -> int:
             "The task was registered against the wrong action config."
         )
 
-    controller = RobolabAtomicController(
-        move_vectors=cfg["move_vectors"],
-        step_m=float(cfg["step_m"]),
-        ik_scale=handle.ik_scale,
-        sim_steps_per_decision=int(cfg["sim_steps_per_decision"]),
-        max_delta_m=float(cfg.get("max_delta_m", 0.05)),
-    )
+    def make_controller() -> RobolabAtomicController:
+        return RobolabAtomicController(
+            move_vectors=cfg["move_vectors"],
+            step_m=float(cfg["step_m"]),
+            ik_scale=handle.ik_scale,
+            sim_steps_per_decision=int(cfg["sim_steps_per_decision"]),
+            max_delta_m=float(cfg.get("max_delta_m", 0.05)),
+        )
+
+    controller = make_controller()
 
     # Auto-release safety rule (plugins.auto_release): reopen a closed gripper whose measured
     # width collapses below empty_width_m (it is holding nothing).
@@ -336,6 +346,50 @@ def _run(args, cfg, client, prompt_path, prompt_template) -> int:
         return MvTokenController(
             client=client,
             prompt_template=prompt_template,
+        )
+
+    def make_parallel_runner(episode: int):
+        """One env-batch rollout: per-env controller, agent (own HTTP client), logger."""
+        from core.sim.mvtoken_robolab_parallel import MvTokenRobolabParallelRunner
+
+        loggers = [
+            logger if (episode == 0 and i == 0)
+            else EpisodeLogger(Path(ROOT) / cfg["log_dir"], episode * num_envs + i, variant=f"RL-{cfg['task']}")
+            for i in range(num_envs)
+        ]
+        for i, lg in enumerate(loggers):
+            if not (episode == 0 and i == 0):
+                lg.write_metadata({**metadata, "episode_index": episode, "env_id": i})
+        agents = [
+            MvTokenController(client=make_vlm_client(args, cfg), prompt_template=prompt_template)
+            for _ in range(num_envs)
+        ]
+        return MvTokenRobolabParallelRunner(
+            env=handle.env,
+            task_description=handle.task_description,
+            controllers=[make_controller() for _ in range(num_envs)],
+            agents=agents,
+            loggers=loggers,
+            config=V0Config.from_dict(cfg.get("v0", {})),
+            max_steps=int(cfg["max_steps"]),
+            num_steps_wait=int(cfg["num_steps_wait"]),
+            sim_steps_per_decision=int(cfg["sim_steps_per_decision"]),
+            settle_steps_per_decision=int(cfg.get("settle_steps_per_decision", 0)),
+            agentview_camera=str(cfg["agentview_camera"]),
+            wrist_camera=str(cfg["wrist_camera"]),
+            agentview_rotation_degrees=int(cfg["agentview_rotation_degrees"]),
+            wrist_rotation_degrees=int(cfg["wrist_rotation_degrees"]),
+            agentview_flip=str(cfg.get("agentview_flip", "none")),
+            wrist_flip=str(cfg.get("wrist_flip", "none")),
+            use_wrist_image=bool(cfg["use_wrist_image"]),
+            auto_release=auto_release,
+            debug=args.debug,
+            prompt_log_every=int(args.prompt_log_every),
+            agentview_square_size=cfg.get("agentview_square_size"),
+            agentview_crop_aspect=cfg.get("agentview_crop_aspect"),
+            wrist_crop_aspect=cfg.get("wrist_crop_aspect"),
+            wrist_square_size=cfg.get("wrist_square_size"),
+            gripper_hold_steps=int(cfg.get("gripper_hold_steps", 0)),
         )
 
     def make_runner(ep_logger: EpisodeLogger) -> MvTokenRobolabRunner:
@@ -381,7 +435,8 @@ def _run(args, cfg, client, prompt_path, prompt_template) -> int:
         "robot_config": cfg,
         "prompt_file": str(prompt_path.resolve()) if prompt_path else None,
         "prompt_version": args.version,
-        "control_loop": "robolab_mvtoken",
+        "control_loop": "robolab_mvtoken" if num_envs == 1 else "robolab_mvtoken_parallel",
+        "num_envs": num_envs,
         "debug": args.debug,
     }
     logger.write_metadata(metadata)
@@ -418,6 +473,28 @@ def _run(args, cfg, client, prompt_path, prompt_template) -> int:
         return 0
 
     successes = 0
+    if num_envs > 1:
+        total = 0
+        for episode in range(episodes):
+            if episode > 0:
+                handle.env.reset_eval_state()
+            results = make_parallel_runner(episode).run()
+            for i, result in enumerate(results):
+                total += 1
+                successes += int(result.success)
+                print(
+                    f"[episode {episode} env {i}] success={result.success} steps={result.steps} "
+                    f"end_reason={result.end_reason}"
+                )
+                print(f"  run dir: {result.run_dir}")
+                print(f"  video:   {result.video_path}")
+        print(f"Success rate: {successes}/{total}")
+        try:
+            handle.env.close()
+        except Exception:
+            pass
+        return 0 if successes else 2
+
     for episode in range(episodes):
         ep_logger = (
             logger

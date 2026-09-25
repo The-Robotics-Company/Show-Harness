@@ -22,6 +22,7 @@ import base64
 import hashlib
 import json
 import os
+import queue
 import shutil
 import sys
 import tempfile
@@ -32,6 +33,7 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 
 from openai_codex import ApprovalMode, Codex, CodexConfig, LocalImageInput, Sandbox, TextInput
 from openai_codex.generated.v2_all import ReasoningEffort
@@ -60,17 +62,40 @@ def codex_binary() -> str:
 
 
 class CodexBridge:
-    def __init__(self, default_model: str, default_effort: str, log_dir: Path):
+    def __init__(self, default_model: str, default_effort: str, log_dir: Path, pool_size: int = 8):
         self.default_model, self.default_effort = default_model, default_effort
         self.workspace = tempfile.TemporaryDirectory(prefix="codex-proxy-")
-        self.client = Codex(CodexConfig(codex_bin=codex_binary(), cwd=self.workspace.name,
-                                        config_overrides=CONFIG_OVERRIDES, client_name="showharness_codex_proxy"))
-        self.lock = threading.Lock()
+        # A pool of Codex app-server clients so concurrent requests (one per parallel env) run
+        # concurrently instead of queueing behind one client; grown lazily up to pool_size.
+        self.pool_size = max(1, int(pool_size))
+        self._pool: "queue.Queue" = queue.Queue()
+        self._made, self._make_lock = 0, threading.Lock()
+        self.client = self._acquire()          # first client, also used for models()
+        self._release(self.client)
+        self.lock = threading.Lock()           # guards the request counter + log file only
         self.log_dir = log_dir
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.log = open(self.log_dir / f"requests_{time.strftime('%Y%m%d_%H%M%S')}.jsonl", "a")
         self.models = {m.model: m for m in self.client.models(include_hidden=True).data}
         self.n = 0
+
+    def _new_client(self):
+        return Codex(CodexConfig(codex_bin=codex_binary(), cwd=self.workspace.name,
+                                 config_overrides=CONFIG_OVERRIDES, client_name="showharness_codex_proxy"))
+
+    def _acquire(self):
+        try:
+            return self._pool.get_nowait()
+        except queue.Empty:
+            pass
+        with self._make_lock:
+            if self._made < self.pool_size:
+                self._made += 1
+                return self._new_client()
+        return self._pool.get()
+
+    def _release(self, client) -> None:
+        self._pool.put(client)
 
     def efforts(self, model: str) -> list[str]:
         m = self.models.get(model)
@@ -106,8 +131,9 @@ class CodexBridge:
                           "properties": {"action": {"type": "string", "enum": list(guided_choice)}},
                           "required": ["action"]}
             t0 = time.monotonic()
-            with self.lock:
-                thread = self.client.thread_start(
+            client = self._acquire()
+            try:
+                thread = client.thread_start(
                     model=model, cwd=self.workspace.name, ephemeral=True, sandbox=Sandbox.read_only,
                     approval_mode=ApprovalMode.deny_all, base_instructions=BASE_INSTRUCTIONS,
                     config={"model_reasoning_effort": effort})
@@ -127,6 +153,8 @@ class CodexBridge:
                         status = event.payload.model_dump(mode="json", by_alias=True)["turn"]["status"]
                         if status != "completed":
                             raise HTTPException(502, f"Codex turn status {status}")
+            finally:
+                self._release(client)
             latency = time.monotonic() - t0
             if text is None:
                 raise HTTPException(502, "Codex returned no message")
@@ -136,11 +164,14 @@ class CodexBridge:
                 except Exception:  # noqa: BLE001  fall back to the raw text; the client parses it
                     pass
             usage = usage or {}
-            self.n += 1
-            rec = {"n": self.n, "time": time.time(), "model": model, "effort": effort, "latency_s": round(latency, 2),
+            with self.lock:
+                self.n += 1
+                n = self.n
+            rec = {"n": n, "time": time.time(), "model": model, "effort": effort, "latency_s": round(latency, 2),
                    "images": len(images), "prompt_sha256": hashlib.sha256("\n".join(texts).encode()).hexdigest()[:16],
                    "guided": list(guided_choice) if guided_choice else None, "reply": text[:200], "usage": usage}
-            self.log.write(json.dumps(rec) + "\n"); self.log.flush()
+            with self.lock:
+                self.log.write(json.dumps(rec) + "\n"); self.log.flush()
             return {
                 "id": f"chatcmpl-{uuid.uuid4().hex[:12]}", "object": "chat.completion", "created": int(time.time()),
                 "model": model,
@@ -154,7 +185,11 @@ class CodexBridge:
 
     def close(self):
         self.log.close()
-        self.client.close()
+        while not self._pool.empty():
+            try:
+                self._pool.get_nowait().close()
+            except Exception:  # noqa: BLE001
+                pass
         self.workspace.cleanup()
 
 
@@ -164,10 +199,11 @@ def main() -> int:
     p.add_argument("--port", type=int, default=8010)
     p.add_argument("--model", default="gpt-6-astra", help="default Codex model (per-request `model` overrides)")
     p.add_argument("--effort", default="medium", help="default reasoning effort (per-request `model:effort` overrides)")
+    p.add_argument("--pool", type=int, default=8, help="max concurrent Codex clients (one per in-flight request)")
     p.add_argument("--log-dir", default=str(Path(__file__).resolve().parents[2] / "rollouts" / "codex_proxy"))
     args = p.parse_args()
 
-    bridge = CodexBridge(args.model, args.effort, Path(args.log_dir))
+    bridge = CodexBridge(args.model, args.effort, Path(args.log_dir), pool_size=args.pool)
     if args.model not in bridge.models:
         print(f"[codex-proxy] WARNING: default model {args.model!r} not in this account's list: "
               f"{sorted(bridge.models)}", file=sys.stderr)
@@ -191,8 +227,10 @@ def main() -> int:
             raise HTTPException(400, f"effort {effort!r} not supported by {model}; choose from {allowed}")
         if body.get("stream"):
             raise HTTPException(400, "streaming is not supported")
-        return bridge.complete(model, effort, body.get("messages", []), body.get("guided_choice"),
-                               body.get("max_tokens") or body.get("max_completion_tokens"))
+        # Off the event loop: Codex turns block for seconds, and parallel envs send them together.
+        return await run_in_threadpool(bridge.complete, model, effort, body.get("messages", []),
+                                       body.get("guided_choice"),
+                                       body.get("max_tokens") or body.get("max_completion_tokens"))
 
     print(f"[codex-proxy] serving http://{args.host}:{args.port}/v1  model={args.model} effort={args.effort} "
           f"log={args.log_dir}", flush=True)

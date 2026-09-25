@@ -179,6 +179,29 @@ def launch_isaac(
 
 
 # -- env construction --------------------------------------------------------
+def _droid_rig(task: str):
+    """RoboLab's ``home_office`` scene rig at the task scene's ground height (RoboLab's
+    ``--rig home_office --rig-ground auto`` default)."""
+    import json
+
+    from robolab.constants import SCENE_DIR, TASK_DIR
+    from robolab.core.scenes import utils as scene_utils
+    from robolab.registrations.rig import DEFAULT_GROUND_Z, rig_cfg, rig_usd_path, scene_ground_z
+
+    ground = DEFAULT_GROUND_Z
+    try:
+        meta = json.load(open(os.path.join(TASK_DIR, "_metadata", "task_metadata.json")))
+        entries = meta if isinstance(meta, list) else meta.get("tasks", [])
+        scene = next(e.get("scene") for e in entries if isinstance(e, dict) and e.get("task_name") == task)
+        if scene:
+            ground = round(scene_ground_z(scene_utils.find_scene_file(scene, SCENE_DIR)), 6)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[robolab] rig ground lookup failed ({exc}); using {DEFAULT_GROUND_Z}")
+    rig = rig_cfg("home_office", ground_z=ground)
+    print(f"[robolab] scene rig: {rig_usd_path(rig)} at ground z={ground:.4f}")
+    return rig
+
+
 def make_robolab_task(
     task: str,
     *,
@@ -259,6 +282,10 @@ def make_robolab_task(
         kwargs: dict[str, Any] = {"task": task, "cameras": _camera_preset(camera_preset)}
         if task_dirs:
             kwargs["task_dirs"] = list(task_dirs)
+        # Same look as trc-policy-lab's pi05 / Astra rollouts: the home_office rig USD (HDR dome
+        # + visible ground plane, spawned once at /World) instead of RoboLab's stock
+        # SphereLight + full-scale HDR backdrop, so the three baselines see the same scene.
+        kwargs.update(lighting_cfg=_droid_rig(task), background_cfg=None)
         auto_register_droid_rel_ik_envs(**kwargs)
         ik_scale = float(getattr(DroidRelIKActionCfg().arm_action, "scale", 0.5))
     else:
@@ -819,6 +846,24 @@ def step_robolab(env: Any, action: np.ndarray) -> tuple[dict, bool, bool, dict]:
         obs,
         bool(to_np(terminated).reshape(-1)[0]),
         bool(to_np(truncated).reshape(-1)[0]),
+        info,
+    )
+
+
+def step_robolab_batched(env: Any, actions: np.ndarray) -> tuple[dict, np.ndarray, np.ndarray, dict]:
+    """One env step with a per-env action batch ``(num_envs, action_dim)``.
+
+    Same control period as :func:`step_robolab`; returns the per-env ``terminated`` and
+    ``truncated`` flags as bool arrays instead of env 0's only.
+    """
+    ensure_timeline_playing(env)
+    obs, _reward, terminated, truncated, info = env.step(
+        batched_action(np.asarray(actions, dtype=np.float32), env.num_envs, env.device)
+    )
+    return (
+        obs,
+        to_np(terminated).reshape(-1).astype(bool),
+        to_np(truncated).reshape(-1).astype(bool),
         info,
     )
 
